@@ -7,6 +7,46 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "adaptive-classifier"
+version = "0.0.14"
+description = "A flexible, adaptive classification system for dynamic text classification"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "faiss-cpu>=1.7.4",
+    "huggingface-hub>=0.17.0",
+    "numpy>=1.24.0",
+    "safetensors>=0.3.1",
+    "scikit-learn>=1.7.0",
+    "setuptools>=65.0.0",
+    "torch>=2.0.0",
+    "tqdm>=4.65.0",
+    "transformers>=4.30.0",
+    "wheel>=0.40.0",
+]
+
+[tool.uv.sources]
+numpy = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl"
+explicit = true
+
+[project.urls]
+Repository = "https://github.com/codelion/adaptive-classifier"
+Article = "https://huggingface.co/blog/codelion/adaptive-classifier"
+"Reference - Strategic Classification" = "https://arxiv.org/abs/1506.06980"
+"Reference - RouteLLM: Learning to Route LLMs with Preference Data" = "https://arxiv.org/abs/2406.18665"
+"Reference - Transformer^2: Self-adaptive LLMs" = "https://arxiv.org/abs/2501.06252"
+"Reference - Lamini Classifier Agent Toolkit" = "https://www.lamini.ai/blog/classifier-agent-toolkit"
+"Reference - Protoformer: Embedding Prototypes for Transformers" = "https://arxiv.org/abs/2206.12710"
+"Reference - Overcoming catastrophic forgetting in neural networks" = "https://arxiv.org/abs/1612.00796"
+"Reference - RAGTruth: A Hallucination Corpus for Developing Trustworthy Retrieval-Augmented Language Models" = "https://arxiv.org/abs/2401.00396"
+"Reference - LettuceDetect: A Hallucination Detection Framework for RAG Applications" = "https://arxiv.org/abs/2502.17125"
+
 [tool.pytest.ini_options]
 minversion = "7.0"
 addopts = "-ra -q"
