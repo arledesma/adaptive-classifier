@@ -56,3 +56,11 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::UserWarning",
 ]
+
+[dependency-groups]
+dev = [
+    "datasets>=3.6.0",
+    "openai>=1.91.0",
+    "sentence-transformers>=4.1.0",
+    "textdistance>=4.6.3",
+]
