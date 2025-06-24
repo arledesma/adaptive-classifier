@@ -26,6 +26,7 @@ classifiers = [
 # ONNX Runtime (via optimum) stays in the core install: the default CPU path
 # uses it, and the README advertises faster CPU inference out of the box.
 dependencies = [
+    "pyattck",
     "torch>=2.0.0",
     "transformers>=4.30.0",
     "safetensors>=0.3.1",
@@ -73,6 +74,7 @@ scripts = [
 [tool.uv.sources]
 numpy = { index = "pytorch-cu128" }
 torch = { index = "pytorch-cu128" }
+pyattck = { git = "https://github.com/CAPESandbox/pyattck" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
