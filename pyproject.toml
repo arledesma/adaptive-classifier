@@ -17,6 +17,7 @@ dependencies = [
     "faiss-cpu>=1.7.4",
     "huggingface-hub>=0.17.0",
     "numpy>=1.24.0",
+    "pyattck",
     "safetensors>=0.3.1",
     "scikit-learn>=1.7.0",
     "setuptools>=65.0.0",
@@ -29,6 +30,7 @@ dependencies = [
 [tool.uv.sources]
 numpy = { index = "pytorch-cu128" }
 torch = { index = "pytorch-cu128" }
+pyattck = { git = "https://github.com/CAPESandbox/pyattck" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
