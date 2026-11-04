@@ -12,7 +12,8 @@ import math
 import numbers
 import threading
 from pathlib import Path
-from safetensors.torch import save_file, load_file
+from datetime import datetime, timezone
+from safetensors.torch import save as save_tensors, load as load_tensors
 import json
 from sklearn.cluster import KMeans
 from huggingface_hub import ModelHubMixin, hf_hub_download
@@ -44,6 +45,69 @@ def _has_local_tokenizer(directory: Path) -> bool:
     return (directory / "tokenizer.json").exists() or (directory / "tokenizer_config.json").exists()
 
 
+def _replace_file(source: Path, target: Path, attempts: int = 10):
+    """`os.replace` with retries.
+
+    On Windows replacing a file fails with PermissionError while another
+    process (a reader, a virus scanner, a backup agent) has it open without
+    FILE_SHARE_DELETE. Such holds are usually brief, so retry with backoff
+    before giving up.
+    """
+    import time
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(min(0.05 * 2 ** attempt, 1.0))
+
+
+def _write_atomically(target: Path, data: bytes):
+    """Write `data` to a temporary file next to `target`, then move it into place.
+
+    Readers see the old file or the new one, never a partial write.
+    """
+    import tempfile
+    target = Path(target)
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        _replace_file(Path(tmp), target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _existing_onnx_export(directory: Path, model_name: str) -> bool:
+    """True when `directory` already holds an ONNX export of the encoder `model_name`.
+
+    The encoder is never trained by this library, so an export made from the
+    same base model is still current and need not be redone.
+    """
+    onnx_dir = directory / "onnx"
+    # Either file will do: quantizing is decided when the export is first made, and a
+    # classifier loaded from this export re-saves it under whichever name it has.
+    if not any((onnx_dir / name).exists() for name in ("model.onnx", "model_quantized.onnx")):
+        return False
+    try:
+        saved = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return saved.get("model_name") == model_name
+
+
 def _synchronized(method):
     """Run a method while holding the instance lock.
 
@@ -67,6 +131,10 @@ class AdaptiveClassifier(ModelHubMixin):
     # Set by `calibrate`. A class-level default keeps instances built without
     # __init__ (the loaders do that) working.
     calibration: Optional[Dict[str, Any]] = None
+    # When `calibrate` last ran (ISO-8601 UTC) and how many examples were added since.
+    # Both are saved with the classifier.
+    last_calibrated_at: Optional[str] = None
+    examples_since_calibration: int = 0
 
     @property
     def _lock(self) -> "threading.RLock":
@@ -256,6 +324,7 @@ class AdaptiveClassifier(ModelHubMixin):
             'training_history': dict(self.training_history),
             'train_steps': self.train_steps,
             'calibration': self.calibration,
+            'examples_since_calibration': self.examples_since_calibration,
             'head': copy.deepcopy(self.adaptive_head),
             'examples': {label: list(items) for label, items in memory.examples.items()},
             'prototypes': {label: proto.clone() for label, proto in memory.prototypes.items()},
@@ -274,6 +343,7 @@ class AdaptiveClassifier(ModelHubMixin):
         self.training_history = snapshot['training_history']
         self.train_steps = snapshot['train_steps']
         self.calibration = snapshot['calibration']
+        self.examples_since_calibration = snapshot['examples_since_calibration']
         self.adaptive_head = snapshot['head']
         memory.examples.clear()
         memory.examples.update(snapshot['examples'])
@@ -318,6 +388,7 @@ class AdaptiveClassifier(ModelHubMixin):
             if label not in self.training_history:
                 self.training_history[label] = 0
             self.training_history[label] += 1
+        self.examples_since_calibration += len(texts)
 
         # Determine training strategy: only use special new class handling for incremental learning
         is_incremental_learning = is_adding_new_classes and has_existing_classes
@@ -600,10 +671,11 @@ class AdaptiveClassifier(ModelHubMixin):
         """How far `text` sits outside the known classes.
 
         The score is the distance to the nearest class prototype divided by
-        that class's radius (the distance from its prototype to its farthest
-        training example). Around 1.0 or below means the text looks like
-        something the class has seen; larger means further out. Returns
-        infinity when the classifier has no classes.
+        that class's radius: the `ood_radius_percentile`-th percentile (95 by
+        default) of its training examples' distances to the prototype. A score
+        of 1.0 is exactly that far out, so about 5% of a class's own training
+        examples score above 1.0; `is_ood` flags scores above `ood_threshold`.
+        Returns infinity when the classifier has no classes.
         """
         if not text:
             raise ValueError("Empty input text")
@@ -637,6 +709,29 @@ class AdaptiveClassifier(ModelHubMixin):
         """`add_examples` without blocking the event loop."""
         return await asyncio.to_thread(self.add_examples, texts, labels)
 
+    async def apredict_batch_with_ood(self, texts: List[str], k: int = 5, **kwargs):
+        """`predict_batch_with_ood` without blocking the event loop."""
+        return await asyncio.to_thread(self.predict_batch_with_ood, texts, k, **kwargs)
+
+    @_synchronized
+    def set_max_examples_per_class(self, limit: int, retrain: bool = True) -> int:
+        """Change `max_examples_per_class` and prune every class to it now.
+
+        Pruning keeps each class's newest examples plus its older examples
+        closest to another class (see `retention_recent_fraction`).
+
+        Returns the number of examples evicted. Prototypes and the search index
+        are updated, and the neural head is retrained on what remains when
+        anything was evicted and `retrain` is true.
+        """
+        if not isinstance(limit, numbers.Integral) or isinstance(limit, bool) or limit < 1:
+            raise ValueError(f"max_examples_per_class must be a positive integer; got {limit!r}")
+        self.config.max_examples_per_class = int(limit)
+        evicted = self.memory.enforce_limit()
+        if evicted and retrain and self.adaptive_head is not None and self.memory.examples:
+            self._train_adaptive_head()
+        return evicted
+
     # --- calibration ---------------------------------------------------------------
 
     def _calibrate(self, predictions: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
@@ -655,8 +750,9 @@ class AdaptiveClassifier(ModelHubMixin):
         try:
             n = len(self.id_to_label)
             matrix = np.zeros((len(texts), n))
-            for row, text in enumerate(texts):
-                for label, score in self.predict(text, k=n):
+            # predict_batch scores exactly as predict does, with one encoder pass per chunk.
+            for row, predictions in enumerate(self.predict_batch(texts, k=n)):
+                for label, score in predictions:
                     matrix[row, self.label_to_id[label]] = score
         finally:
             self.calibration = saved
@@ -707,6 +803,8 @@ class AdaptiveClassifier(ModelHubMixin):
             'scores': sorted(float(score) for score in scores),
             'n': int(len(targets)),
         }
+        self.last_calibrated_at = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        self.examples_since_calibration = 0
         before = calibration_math.summarise(probs, targets)
         after = calibration_math.summarise(calibrated, targets)
         return {
@@ -715,6 +813,7 @@ class AdaptiveClassifier(ModelHubMixin):
             'ece_before': before['ece'], 'ece_after': after['ece'],
             'nll_before': before['nll'], 'nll_after': after['nll'],
             'accuracy': before['accuracy'],
+            'calibrated_at': self.last_calibrated_at,
         }
 
     @_synchronized
@@ -839,7 +938,7 @@ class AdaptiveClassifier(ModelHubMixin):
     def _ood_scores(self, texts: List[str]) -> List[float]:
         with torch.no_grad():
             embeddings = self._get_embeddings(texts)
-        return [self.memory.ood_score(embedding)[0] for embedding in embeddings]
+        return self.memory.ood_scores(torch.stack(embeddings))[0]
 
     @_synchronized
     def drift_report(
@@ -1094,15 +1193,27 @@ class AdaptiveClassifier(ModelHubMixin):
         config: Optional[Dict[str, Any]] = None,
         include_onnx: bool = True,
         quantize_onnx: bool = True,
+        all_examples: bool = False,
+        reuse_onnx: bool = True,
         **kwargs
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Save the model to a directory.
+
+        config.json, examples.json and model.safetensors are each written to a
+        temporary file and moved into place, so a crash or a concurrent reader
+        never sees a half-written file.
 
         Args:
             save_directory: Directory to save the model to
             config: Optional additional configuration
             include_onnx: Whether to include ONNX export (default: True)
             quantize_onnx: Whether to quantize ONNX model (requires include_onnx=True)
+            all_examples: Save every example held in memory (embeddings go in
+                model.safetensors) instead of `num_representative_examples`
+                per class, so a reload continues exactly where this left off.
+            reuse_onnx: Skip the ONNX export, and the tokenizer files, when the
+                directory already holds an export of the same base encoder.
+                The encoder is never trained, so that export is still current.
             **kwargs: Additional arguments passed to save_pretrained
 
         Returns:
@@ -1111,67 +1222,85 @@ class AdaptiveClassifier(ModelHubMixin):
         save_directory = Path(save_directory)
         os.makedirs(save_directory, exist_ok=True)
 
-        # 'auto' is resolved against the base model at run time, so persist the
-        # outcome. Other runtimes (ONNX in .NET/JS, ...) cannot repeat that
-        # lookup, and a reload should not depend on the Hub being reachable.
-        saved_settings = self.config.to_dict()
-        saved_settings['pooling'] = self._resolve_pooling()
+        # Decide before config.json is overwritten: it records which encoder the
+        # existing export came from.
+        encoder_current = reuse_onnx and _existing_onnx_export(
+            save_directory, self._base_model_name())
 
-        # Save configuration and metadata
-        config_dict = {
-            'model_name': self._base_model_name(),
-            'embedding_dim': self.embedding_dim,
-            'label_to_id': self.label_to_id,
-            'id_to_label': {str(k): v for k, v in self.id_to_label.items()},
-            'train_steps': self.train_steps,
-            'training_history': self.training_history,  # Save cumulative training counts
-            'ood_radii': {label: self.memory.class_radius(label) for label in self.memory.prototypes},
-            'calibration': self.calibration,
-            'config': saved_settings,
-            **self._extra_state(),
-            'library_name': 'adaptive-classifier'  # Tell HuggingFace Hub this requires the adaptive-classifier library
-        }
+        # Collect and write the learned state under the lock so it is consistent even
+        # while another thread updates the classifier; the slow parts (tokenizer files,
+        # ONNX export) run outside it.
+        with self._lock:
+            # 'auto' is resolved against the base model at run time, so persist the
+            # outcome. Other runtimes (ONNX in .NET/JS, ...) cannot repeat that
+            # lookup, and a reload should not depend on the Hub being reachable.
+            saved_settings = self.config.to_dict()
+            saved_settings['pooling'] = self._resolve_pooling()
 
-        # Save examples in a separate file to keep config clean
-        saved_examples = {}
-        for label, examples in self.memory.examples.items():
-            saved_examples[label] = [
-                ex.to_dict() for ex in
-                self.select_representative_examples(
-                    examples, k=self.config.num_representative_examples)
-            ]
+            # Save configuration and metadata
+            config_dict = {
+                'model_name': self._base_model_name(),
+                'embedding_dim': self.embedding_dim,
+                'label_to_id': self.label_to_id,
+                'id_to_label': {str(k): v for k, v in self.id_to_label.items()},
+                'train_steps': self.train_steps,
+                'training_history': self.training_history,  # Save cumulative training counts
+                'ood_radii': {label: self.memory.class_radius(label) for label in self.memory.prototypes},
+                'calibration': self.calibration,
+                'last_calibrated_at': self.last_calibrated_at,
+                'examples_since_calibration': self.examples_since_calibration,
+                'config': saved_settings,
+                **self._extra_state(),
+                'library_name': 'adaptive-classifier'  # Tell HuggingFace Hub this requires the adaptive-classifier library
+            }
 
-        # Save model tensors
-        tensor_dict = {}
-        
-        # Save prototypes
-        for label, proto in self.memory.prototypes.items():
-            tensor_dict[f'prototype_{label}'] = proto
-        
-        # Save adaptive head if it exists
-        if self.adaptive_head is not None:
-            for name, param in self.adaptive_head.state_dict().items():
-                tensor_dict[f'adaptive_head_{name}'] = param
+            # Save model tensors
+            tensor_dict = {}
 
-        # Save files
-        config_file = save_directory / "config.json"
-        examples_file = save_directory / "examples.json"
-        tensors_file = save_directory / "model.safetensors"
+            # Save examples in a separate file to keep config clean
+            saved_examples = {}
+            for label, examples in self.memory.examples.items():
+                if all_examples:
+                    # Texts in JSON, embeddings as one binary tensor per class (in the same
+                    # order): JSON floats would make every save several times larger and slower.
+                    saved_examples[label] = [{'text': ex.text, 'label': ex.label, 'embedding': None}
+                                             for ex in examples]
+                    if examples:
+                        tensor_dict[f'examples_{label}'] = torch.stack(
+                            [ex.embedding for ex in examples]).contiguous()
+                else:
+                    saved_examples[label] = [
+                        ex.to_dict() for ex in
+                        self.select_representative_examples(
+                            examples, k=self.config.num_representative_examples)
+                    ]
 
-        with open(config_file, "w", encoding="utf-8") as f:
-            json.dump(config_dict, f, indent=2, sort_keys=True)
-            
-        with open(examples_file, "w", encoding="utf-8") as f:
-            json.dump(saved_examples, f, indent=2, sort_keys=True)
+            # Save prototypes
+            for label, proto in self.memory.prototypes.items():
+                tensor_dict[f'prototype_{label}'] = proto.contiguous()
 
-        save_file(tensor_dict, tensors_file)
+            # Save adaptive head if it exists
+            if self.adaptive_head is not None:
+                for name, param in self.adaptive_head.state_dict().items():
+                    tensor_dict[f'adaptive_head_{name}'] = param.detach().cpu().contiguous()
+
+            # Save files
+            config_file = save_directory / "config.json"
+            examples_file = save_directory / "examples.json"
+            tensors_file = save_directory / "model.safetensors"
+
+            # Tensors and examples first, config.json last: config.json describes the other two.
+            _write_atomically(tensors_file, save_tensors(tensor_dict))
+            _write_atomically(examples_file, _json_bytes(saved_examples))
+            _write_atomically(config_file, _json_bytes(config_dict))
 
         # Ship the tokenizer so the directory is self-contained for runtimes
         # that cannot call AutoTokenizer (tokenizer.json is the portable form).
-        try:
-            self.tokenizer.save_pretrained(save_directory)
-        except Exception as e:
-            logger.warning(f"Could not save tokenizer files: {e}")
+        if not (encoder_current and _has_local_tokenizer(save_directory)):
+            try:
+                self.tokenizer.save_pretrained(save_directory)
+            except Exception as e:
+                logger.warning(f"Could not save tokenizer files: {e}")
 
         # Generate model card if it doesn't exist
         model_card_path = save_directory / "README.md"
@@ -1181,7 +1310,9 @@ class AdaptiveClassifier(ModelHubMixin):
                 f.write(model_card_content)
 
         # Export ONNX if requested
-        if include_onnx:
+        if include_onnx and encoder_current:
+            logger.debug(f"Reusing the ONNX export already in {save_directory / 'onnx'}")
+        elif include_onnx:
             try:
                 onnx_dir = save_directory / "onnx"
                 self.export_onnx(
@@ -1524,16 +1655,24 @@ class AdaptiveClassifier(ModelHubMixin):
         # Restore training history with backward compatibility
         classifier.training_history = config_dict.get('training_history', {})
         classifier.calibration = config_dict.get('calibration')
+        classifier.last_calibrated_at = config_dict.get('last_calibrated_at')
+        classifier.examples_since_calibration = int(config_dict.get('examples_since_calibration', 0))
         classifier._restore_extra_state(config_dict)
 
-        # Load tensors
-        tensors = load_file(model_path / "model.safetensors")
+        # Load tensors. Read the file into memory rather than memory-mapping it: a mapping
+        # keeps the file open, and on Windows an open file cannot be replaced by a later save.
+        tensors = load_tensors((model_path / "model.safetensors").read_bytes())
 
         # Restore saved examples
         for label, examples_data in saved_examples.items():
-            classifier.memory.examples[label] = [
-                Example.from_dict(ex_data) for ex_data in examples_data
-            ]
+            examples = [Example.from_dict(ex_data) for ex_data in examples_data]
+            stored = tensors.get(f'examples_{label}')
+            if stored is not None:
+                if len(stored) != len(examples):
+                    raise ValueError(f"examples.json and model.safetensors disagree on class '{label}'")
+                for example, embedding in zip(examples, stored):
+                    example.embedding = embedding.clone()
+            classifier.memory.examples[label] = examples
 
         # Restore prototypes
         for label in classifier.label_to_id.keys():
@@ -1544,7 +1683,7 @@ class AdaptiveClassifier(ModelHubMixin):
 
         # Rebuild memory system
         classifier.memory._restore_from_save()
-        classifier.memory.saved_radii = dict(config_dict.get('ood_radii', {}))
+        saved_radii = dict(config_dict.get('ood_radii', {}))
 
         # Restore adaptive head if it exists
         adaptive_head_params = {
@@ -1565,6 +1704,12 @@ class AdaptiveClassifier(ModelHubMixin):
             for label in classifier.memory.prototypes:
                 classifier.memory.set_prototype_base(
                     label, min(classifier.training_history.get(label, 0), cap))
+            # The saved spread only matters for a class whose memory is incomplete (its
+            # prototype was built from more examples than were saved); a class that holds
+            # its whole window measures its spread directly.
+            saved_radii = {label: radius for label, radius in saved_radii.items()
+                           if label in classifier.memory.prototype_base}
+        classifier.memory.saved_radii = saved_radii
 
         # Backward compatibility: estimate training history if not present
         if not classifier.training_history:
@@ -1844,18 +1989,24 @@ This model:
             return f"https://huggingface.co/{repo_id}"
 
     # Keep existing save/load methods for backwards compatibility
-    def save(self, save_dir: str, include_onnx: bool = True, quantize_onnx: bool = True):
+    def save(self, save_dir: str, include_onnx: bool = True, quantize_onnx: bool = True,
+             all_examples: bool = False, reuse_onnx: bool = True):
         """Legacy save method for backwards compatibility.
 
         Args:
             save_dir: Directory to save to
             include_onnx: Whether to include ONNX export (default: True)
             quantize_onnx: Whether to quantize ONNX model
+            all_examples: Save every held example, not just representative ones
+            reuse_onnx: Keep an existing ONNX export of the same encoder instead
+                of exporting (and quantizing) it again
         """
         return self._save_pretrained(
             save_dir,
             include_onnx=include_onnx,
-            quantize_onnx=quantize_onnx
+            quantize_onnx=quantize_onnx,
+            all_examples=all_examples,
+            reuse_onnx=reuse_onnx,
         )
 
     @classmethod
@@ -2058,6 +2209,24 @@ This model:
         batch_size: int = 32
     ) -> List[List[Tuple[str, float]]]:
         """Predict labels for a batch of texts with improved batching."""
+        return self._predict_batch(texts, k, batch_size, with_ood=False)[0]
+
+    @_synchronized
+    def predict_batch_with_ood(
+        self,
+        texts: List[str],
+        k: int = 5,
+        batch_size: int = 32
+    ) -> Tuple[List[List[Tuple[str, float]]], List[float]]:
+        """`predict_batch` plus each text's `ood_score`, from a single encoder pass.
+
+        Returns:
+            (predictions, ood_scores). A score is infinity when the classifier
+            has no classes.
+        """
+        return self._predict_batch(texts, k, batch_size, with_ood=True)
+
+    def _predict_batch(self, texts: List[str], k: int, batch_size: int, with_ood: bool):
         if not texts:
             raise ValueError("Empty input batch")
         self._validate_k(k)
@@ -2065,9 +2234,11 @@ This model:
         if self.strategic_mode:
             # The strategic blend is worked out per text; batching the embeddings
             # would skip it and return different answers from `predict`.
-            return [self.predict(text, k) for text in texts]
+            predictions = [self.predict(text, k) for text in texts]
+            return predictions, (self._ood_scores(texts) if with_ood else None)
 
         all_predictions = []
+        all_ood = [] if with_ood else None
         
         # Process in batches
         for i in range(0, len(texts), batch_size):
@@ -2075,68 +2246,68 @@ This model:
             
             # Get embeddings for batch
             batch_embeddings = self._get_embeddings(batch_texts)
-            
-            # Get predictions for each embedding
-            batch_predictions = []
-            num_classes = len(self.id_to_label)
-            for embedding in batch_embeddings:
-                # Score every class, as `predict` does, and trim to k at the end.
-                # Restricting the lookup to k classes made the scores depend on k
-                # whenever there were more than k classes.
-                proto_preds = self.memory.get_nearest_prototypes(
-                    embedding,
-                    k=num_classes or k
-                )
-
-                # Get neural predictions if available
-                if self.adaptive_head is not None:
-                    self.adaptive_head.eval()
-                    with torch.no_grad():
-                        # Add batch dimension and move to device
-                        input_embedding = embedding.unsqueeze(0).to(self.device)
-                        logits = self.adaptive_head(input_embedding)
-                        # Squeeze batch dimension
-                        logits = logits.squeeze(0)
-                        probs = F.softmax(logits, dim=0)
-
-                        values, indices = torch.topk(probs, num_classes)
-                        head_preds = [
-                            (self.id_to_label[idx.item()], val.item())
-                            for val, idx in zip(values, indices)
-                        ]
-                else:
-                    head_preds = []
-
-                # Combine predictions with the configured weights. This path
-                # used to hardcode 0.7/0.3, so `predict` and `predict_batch`
-                # could disagree once a caller changed the config.
-                combined_scores = {}
-                for label, score in proto_preds:
-                    combined_scores[label] = score * self._blend_weights(label)[0]
-
-                for label, score in head_preds:
-                    combined_scores[label] = (
-                        combined_scores.get(label, 0) + score * self._blend_weights(label)[1]
-                    )
-
-                # Sort and normalize predictions
-                predictions = sorted(
-                    combined_scores.items(),
-                    key=lambda x: x[1],
-                    reverse=True
-                )
-                total = sum(score for _, score in predictions)
-                if total > 0:
-                    predictions = [(label, score/total)
-                                for label, score in predictions]
-
-                if self.calibration:
-                    predictions = self._calibrate(predictions)
-                batch_predictions.append(predictions[:k])
-
-            all_predictions.extend(batch_predictions)
+            if with_ood:
+                all_ood.extend(self.memory.ood_scores(torch.stack(batch_embeddings))[0])
+            all_predictions.extend(self._score_embeddings(batch_embeddings, k))
         
-        return all_predictions
+        return all_predictions, all_ood
+
+    def _score_embeddings(self, batch_embeddings: List[torch.Tensor], k: int) -> List[List[Tuple[str, float]]]:
+        """Blend prototype and head scores for each embedding, as `predict` does."""
+        num_classes = len(self.id_to_label)
+        head_probs = None
+        if self.adaptive_head is not None and batch_embeddings:
+            self.adaptive_head.eval()
+            with torch.no_grad():
+                logits = self.adaptive_head(torch.stack(batch_embeddings).to(self.device))
+                head_probs = F.softmax(logits, dim=1).cpu()
+
+        batch_predictions = []
+        for row, embedding in enumerate(batch_embeddings):
+            # Score every class, as `predict` does, and trim to k at the end.
+            # Restricting the lookup to k classes made the scores depend on k
+            # whenever there were more than k classes.
+            proto_preds = self.memory.get_nearest_prototypes(
+                embedding,
+                k=num_classes or k
+            )
+
+            if head_probs is not None:
+                values, indices = torch.topk(head_probs[row], num_classes)
+                head_preds = [
+                    (self.id_to_label[idx.item()], val.item())
+                    for val, idx in zip(values, indices)
+                ]
+            else:
+                head_preds = []
+
+            # Combine predictions with the configured weights. This path
+            # used to hardcode 0.7/0.3, so `predict` and `predict_batch`
+            # could disagree once a caller changed the config.
+            combined_scores = {}
+            for label, score in proto_preds:
+                combined_scores[label] = score * self._blend_weights(label)[0]
+
+            for label, score in head_preds:
+                combined_scores[label] = (
+                    combined_scores.get(label, 0) + score * self._blend_weights(label)[1]
+                )
+
+            # Sort and normalize predictions
+            predictions = sorted(
+                combined_scores.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )
+            total = sum(score for _, score in predictions)
+            if total > 0:
+                predictions = [(label, score/total)
+                            for label, score in predictions]
+
+            if self.calibration:
+                predictions = self._calibrate(predictions)
+            batch_predictions.append(predictions[:k])
+        return batch_predictions
 
     @_synchronized
     def clear_memory(self, labels: Optional[List[str]] = None):

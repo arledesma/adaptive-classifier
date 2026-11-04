@@ -323,3 +323,115 @@ def test_saving_after_an_update_does_not_block_other_requests(clf, tmp_path, mon
 
     assert done["response"].status_code == 200
     assert elapsed < 1.0, f"/health and /info waited {elapsed:.2f}s behind a save"
+
+
+# --- a continuously updated gate ------------------------------------------------------------------------
+
+def test_predict_batch_without_ood_keeps_its_old_shape(client):
+    body = client.post("/predict_batch", json={"texts": ["tr0_0"]}).json()
+    assert set(body) == {"predictions"}
+
+
+def test_predict_batch_reports_ood_per_text_from_one_encoder_pass(client, clf, data, monkeypatch):
+    far = data.add("far3", 9, 0.1, 7)
+    texts = ["tr0_0", far, "tr2_1"]
+    calls = []
+    real = AdaptiveClassifier._get_embeddings
+    monkeypatch.setattr(AdaptiveClassifier, "_get_embeddings",
+                        lambda self, batch: calls.append(len(batch)) or real(self, batch))
+    body = client.post("/predict_batch", json={"texts": texts, "k": 2, "ood": True}).json()
+    assert calls == [3]
+    assert body["ood_threshold"] == clf.config.ood_threshold
+    assert len(body["ood"]) == len(body["predictions"]) == 3
+    assert [item["ood"] for item in body["ood"]] == [False, True, False]
+    for text, item in zip(texts, body["ood"]):
+        assert set(item) == {"ood_score", "ood"}
+        assert item["ood_score"] == pytest.approx(clf.ood_score(text), rel=1e-5)
+    for got, want in zip(body["predictions"], clf.predict_batch(texts, k=2)):
+        assert [(p["label"], pytest.approx(p["score"])) for p in got] == want
+
+    strict = client.post("/predict_batch", json={"texts": ["tr0_0"], "ood": True, "ood_threshold": 1e-6}).json()
+    assert strict["ood"][0]["ood"] is True and strict["ood_threshold"] == 1e-6
+
+
+def test_default_batch_limit_takes_a_full_cycle(clf):
+    http = TestClient(create_app(clf))
+    assert http.post("/predict_batch", json={"texts": ["tr0_0"] * 1000, "k": 1}).status_code == 200
+    assert http.post("/predict_batch", json={"texts": ["tr0_0"] * 1001}).status_code == 422
+    assert http.get("/info").json()["max_batch"] == 1000
+
+
+def calibration_set(data):
+    return data.classes(20, n_classes=3, noise=0.4, seed=8, prefix="hc")
+
+
+def test_calibrate_endpoint_reports_ece_and_updates_info(clf, data):
+    http = updatable(clf)
+    info = http.get("/info").json()
+    assert info["last_calibrated_at"] is None and info["examples_since_calibration"] == 36
+
+    texts, labels = calibration_set(data)
+    r = http.post("/calibrate", json={"texts": texts, "labels": labels})
+    assert r.status_code == 200
+    body = r.json()
+    assert {"ece_before", "ece_after", "temperature", "calibrated_at"} <= set(body)
+    info = http.get("/info").json()
+    assert info["calibrated"] is True
+    assert info["last_calibrated_at"] == body["calibrated_at"]
+    assert info["examples_since_calibration"] == 0
+
+    http.post("/examples", json={"texts": ["tr0_0", "tr1_0"], "labels": ["C0", "C1"]})
+    assert http.get("/info").json()["examples_since_calibration"] == 2
+
+
+def test_calibrate_needs_updates_and_the_key(clf, data):
+    texts, labels = calibration_set(data)
+    assert TestClient(create_app(clf)).post(
+        "/calibrate", json={"texts": texts, "labels": labels}).status_code == 403
+    keyed = updatable(clf, api_key="secret")
+    assert keyed.post("/calibrate", json={"texts": texts, "labels": labels}).status_code == 401
+    assert keyed.post("/calibrate", json={"texts": texts, "labels": labels},
+                      headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+def test_calibrate_rejects_bad_input(clf):
+    http = updatable(clf)
+    assert http.post("/calibrate", json={"texts": ["tr0_0"], "labels": ["C0"]}).status_code == 422
+    r = http.post("/calibrate", json={"texts": ["tr0_0", "tr1_0"], "labels": ["C0", "nope"]})
+    assert r.status_code == 400 and "Unknown labels" in r.json()["detail"]
+
+
+def test_calibration_and_the_full_memory_are_saved(clf, data, tmp_path):
+    http = updatable(clf, save_dir=str(tmp_path))
+    texts, labels = calibration_set(data)
+    stamp = http.post("/calibrate", json={"texts": texts, "labels": labels}).json()["calibrated_at"]
+    http.post("/examples", json={"texts": ["tr0_0"], "labels": ["C0"]})
+    reloaded = AdaptiveClassifier.load(str(tmp_path), use_onnx=False, device="cpu")
+    assert reloaded.last_calibrated_at == stamp
+    assert reloaded.examples_since_calibration == 1
+    assert reloaded.calibration is not None
+    assert len(reloaded.memory.examples["C0"]) == 13          # every example, not 5 representatives
+
+
+def test_cli_batch_limit_retention_and_radius_flags(saved, launched):
+    serving.main([saved, "--no-onnx", "--max-batch", "2", "--max-examples-per-class", "5",
+                  "--retention-recent-fraction", "0.4", "--ood-radius-percentile", "80"])
+    client = TestClient(launched["app"])
+    assert client.post("/predict_batch", json={"texts": ["tr0_0"] * 3}).status_code == 422
+    info = client.get("/info").json()
+    assert info["max_examples_per_class"] == 5 and info["ood_radius_percentile"] == 80.0
+    assert info["retention_recent_fraction"] == 0.4
+    assert max(info["examples_per_class"].values()) <= 5
+
+
+def test_cli_default_batch_limit_is_1000(saved, launched):
+    serving.main([saved, "--no-onnx"])
+    assert TestClient(launched["app"]).get("/info").json()["max_batch"] == 1000
+
+
+@pytest.mark.parametrize("flags", [["--max-batch", "0"], ["--ood-radius-percentile", "0"],
+                                   ["--max-examples-per-class", "0"],
+                                   ["--retention-recent-fraction", "1.5"]])
+def test_cli_rejects_bad_limits(saved, launched, flags):
+    with pytest.raises(SystemExit):
+        serving.main([saved, "--no-onnx", *flags])

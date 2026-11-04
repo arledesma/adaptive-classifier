@@ -140,8 +140,20 @@ class ModelConfig:
         self.learning_rate = self.config.get('learning_rate', 0.001)
         self.warmup_steps = self.config.get('warmup_steps', 0)
         
-        # Memory settings
+        # Memory settings. At most `max_examples_per_class` examples are held per
+        # class. When a class goes over, it keeps its newest
+        # `retention_recent_fraction` of the cap (so it follows drift) and fills
+        # the rest with the older examples closest to another class's prototype
+        # (the borderline cases that define the decision boundary and the class's
+        # spread). Before this, the examples closest to the class mean were kept,
+        # which threw away exactly those borderline cases. Prototypes, the search
+        # index, the out-of-distribution radius and the neural head (retrained on
+        # every update) all follow the retained examples.
         self.max_examples_per_class = self.config.get('max_examples_per_class', 1000)
+        self.retention_recent_fraction = float(self.config.get('retention_recent_fraction', 0.5))
+        if not 0.0 <= self.retention_recent_fraction <= 1.0:
+            raise ValueError(
+                f"retention_recent_fraction must be in [0, 1]; got {self.retention_recent_fraction}")
         self.prototype_update_frequency = self.config.get('prototype_update_frequency', 100)
         self.similarity_threshold = self.config.get('similarity_threshold', 0.6)
         
@@ -191,14 +203,25 @@ class ModelConfig:
         self.head_learning_rate = self.config.get('head_learning_rate', 0.003)
         self.min_confidence = self.config.get('min_confidence', 0.1)
 
-        # Out-of-distribution detection. A query is scored by how far it sits
-        # from its nearest class prototype relative to that class's own spread
-        # (the farthest training example from the prototype). A score above
-        # `ood_threshold` means "further out than anything this class has seen
-        # by that factor". `ood_min_radius` stops one-example classes from
-        # having a zero radius.
+        # Out-of-distribution detection. A query is scored by its distance to
+        # the nearest class prototype divided by that class's radius: the
+        # `ood_radius_percentile`-th percentile of its training examples'
+        # distances to the prototype. A score of 1.0 is as far out as that
+        # percentile, so with the default 95 about 5% of a class's own training
+        # examples score above 1.0. A score above `ood_threshold` is
+        # out-of-distribution. Before this, the radius was the farthest
+        # training example (percentile 100), which with thousands of examples
+        # covers nearly everything. `ood_min_radius` stops one-example classes
+        # from having a zero radius.
         self.ood_threshold = self.config.get('ood_threshold', 1.25)
         self.ood_min_radius = self.config.get('ood_min_radius', 0.05)
+        self.ood_radius_percentile = float(self.config.get('ood_radius_percentile', 95.0))
+        if not 0.0 < self.ood_radius_percentile <= 100.0:
+            raise ValueError(
+                f"ood_radius_percentile must be in (0, 100]; got {self.ood_radius_percentile}")
+        if int(self.max_examples_per_class) < 1:
+            raise ValueError(
+                f"max_examples_per_class must be at least 1; got {self.max_examples_per_class}")
         
         # Device settings
         self.device_map = self.config.get('device_map', 'auto')
@@ -237,6 +260,7 @@ class ModelConfig:
             'learning_rate': self.learning_rate,
             'warmup_steps': self.warmup_steps,
             'max_examples_per_class': self.max_examples_per_class,
+            'retention_recent_fraction': self.retention_recent_fraction,
             'prototype_update_frequency': self.prototype_update_frequency,
             'similarity_threshold': self.similarity_threshold,
             'ewc_lambda': self.ewc_lambda,
@@ -255,6 +279,7 @@ class ModelConfig:
             'min_confidence': self.min_confidence,
             'ood_threshold': self.ood_threshold,
             'ood_min_radius': self.ood_min_radius,
+            'ood_radius_percentile': self.ood_radius_percentile,
             'device_map': self.device_map,
             'quantization': self.quantization,
             'gradient_checkpointing': self.gradient_checkpointing,

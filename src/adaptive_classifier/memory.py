@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -79,7 +80,7 @@ class PrototypeMemory:
             self.post_sum[label] = self.post_sum[label] + example.embedding
             self.post_n[label] += 1
         
-        # Check if we need to prune examples after adding
+        # Keep at most max_examples_per_class (newest plus boundary examples; see _prune_examples).
         if len(self.examples[label]) > self.config.max_examples_per_class:
             self._prune_examples(label)
         
@@ -166,8 +167,13 @@ class PrototypeMemory:
             return
             
         if label in self.prototype_base:
+            # The class holds at most max_examples_per_class examples: the post_n added
+            # since loading, plus as many of the older ones (summarised by the saved
+            # prototype) as still fit under that cap. The first eviction drops the base.
             base, count = self.prototype_base[label]
-            prototype = (base * count + self.post_sum[label]) / (count + self.post_n[label])
+            post_n = self.post_n[label]
+            weight = max(0, min(count, self.config.max_examples_per_class - post_n))
+            prototype = (base * weight + self.post_sum[label]) / (weight + post_n)
         else:
             # Compute mean of embeddings
             embeddings = torch.stack([ex.embedding for ex in examples])
@@ -218,27 +224,61 @@ class PrototypeMemory:
         self.updates_since_rebuild = 0
     
     def _prune_examples(self, label: str):
-        """Prune examples for a given label to maintain memory bounds."""
+        """Evict examples of `label` until at most max_examples_per_class remain.
+
+        Retention policy, "recent + boundary": examples are held in the order
+        they were added (a reloaded memory's saved examples count as the
+        oldest). The newest `ceil(retention_recent_fraction * limit)` are always
+        kept, so the class follows drift. The rest of the cap goes to the older
+        examples that lie closest to another class's prototype: the borderline
+        cases that decide the boundary and that give the class its true spread.
+        With no other class, the remaining slots also go to the newest examples.
+        Kept examples stay in arrival order.
+
+        The caller recomputes the prototype (now the mean of the held examples)
+        and the search index; the neural head is retrained on what remains by
+        the next training pass (`add_examples` always runs one).
+        """
+        limit = self.config.max_examples_per_class
         examples = self.examples[label]
-        if not examples:
-            return
-            
-        # Compute distances to mean embedding (more stable than current prototype)
-        embeddings = torch.stack([ex.embedding for ex in examples])
-        mean_embedding = torch.mean(embeddings, dim=0)
-        
-        distances = []
-        for ex in examples:
-            dist = torch.norm(ex.embedding - mean_embedding).item()
-            distances.append(dist)
-            
-        # Sort by distance and keep closest examples
-        sorted_indices = np.argsort(distances)
-        keep_indices = sorted_indices[:self.config.max_examples_per_class]
-        
-        # Update examples - ensure we don't exceed max size
-        self.examples[label] = [examples[i] for i in keep_indices]
-        assert len(self.examples[label]) <= self.config.max_examples_per_class
+        if len(examples) <= limit:
+            return 0
+        evicted = len(examples) - limit
+        fraction = float(getattr(self.config, 'retention_recent_fraction', 0.5))
+        n_recent = min(limit, math.ceil(fraction * limit))
+        n_boundary = limit - n_recent
+        split = len(examples) - n_recent
+        older, recent = examples[:split], examples[split:]
+        others = [proto for other, proto in self.prototypes.items() if other != label]
+        if n_boundary == 0:
+            kept_older = []
+        elif not others:
+            kept_older = older[len(older) - n_boundary:]
+        else:
+            embeddings = torch.stack([ex.embedding for ex in older]).float()
+            to_other = torch.cdist(embeddings, torch.stack(others).float()).min(dim=1).values
+            nearest = np.argsort(to_other.numpy(), kind='stable')[:n_boundary]
+            kept_older = [older[i] for i in sorted(int(i) for i in nearest)]
+        self.examples[label] = kept_older + recent
+        # The saved prototype and spread summarised examples that were never held,
+        # and an evicted set can no longer be described by them: from now on the
+        # class is described by the examples it holds.
+        if label in self.prototype_base:
+            self._forget_base(label)
+            self.saved_radii.pop(label, None)
+        return evicted
+
+    def enforce_limit(self) -> int:
+        """Apply max_examples_per_class to every class (after lowering it). Returns the number evicted."""
+        evicted = 0
+        for label in list(self.examples):
+            removed = self._prune_examples(label)
+            if removed:
+                evicted += removed
+                self._update_prototype(label)
+        if evicted:
+            self._rebuild_index()
+        return evicted
     
     def get_stats(self) -> Dict[str, Any]:
         """Get memory statistics.
@@ -308,28 +348,45 @@ class PrototypeMemory:
         return removed
 
     def class_radius(self, label: str) -> float:
-        """Distance from the prototype to the farthest known example."""
+        """The `ood_radius_percentile`-th percentile of example-to-prototype distances.
+
+        Computed over the examples held for the class. A class whose memory
+        holds only part of what its prototype was built from (a reloaded or
+        merged classifier) also has a recorded radius, which acts as a floor.
+        """
         radius = self.saved_radii.get(label, 0.0)
         examples = self.examples.get(label)
         if examples and label in self.prototypes:
             embeddings = torch.stack([ex.embedding for ex in examples])
-            distances = torch.norm(embeddings - self.prototypes[label], dim=1)
-            radius = max(radius, float(distances.max()))
+            distances = torch.norm(embeddings - self.prototypes[label], dim=1).numpy()
+            percentile = float(getattr(self.config, 'ood_radius_percentile', 95.0))
+            radius = max(radius, float(np.percentile(distances, percentile)))
         return radius
+
+    def ood_scores(self, query_embeddings: torch.Tensor):
+        """Batched `ood_score`: (scores, labels) for each row of `query_embeddings`."""
+        n = len(query_embeddings)
+        if not self.prototypes:
+            return [float('inf')] * n, [None] * n
+        labels = list(self.prototypes)
+        prototypes = torch.stack([self.prototypes[label] for label in labels]).float()
+        radii = torch.tensor([max(self.class_radius(label), self.config.ood_min_radius)
+                              for label in labels], dtype=torch.float32)
+        queries = torch.as_tensor(query_embeddings, dtype=torch.float32).reshape(n, -1)
+        ratios = torch.cdist(queries, prototypes) / radii
+        best, index = ratios.min(dim=1)
+        return [float(v) for v in best], [labels[int(i)] for i in index]
 
     def ood_score(self, query_embedding: torch.Tensor):
         """Return (score, label): the smallest distance-to-radius ratio over classes.
 
-        1.0 means the query is exactly as far from the prototype as the most
-        remote training example. Returns (inf, None) when the memory is empty.
+        1.0 means the query is exactly as far from the nearest prototype as that
+        class's radius (by default the 95th percentile of its training examples'
+        distances, so about 5% of its own training examples score above 1.0).
+        Returns (inf, None) when the memory is empty.
         """
-        best_score, best_label = float('inf'), None
-        for label, prototype in self.prototypes.items():
-            radius = max(self.class_radius(label), self.config.ood_min_radius)
-            score = float(torch.norm(query_embedding - prototype)) / radius
-            if score < best_score:
-                best_score, best_label = score, label
-        return best_score, best_label
+        scores, labels = self.ood_scores(query_embedding.reshape(1, -1))
+        return scores[0], labels[0]
 
     def clear(self):
         """Clear all memory."""

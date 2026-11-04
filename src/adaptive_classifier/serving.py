@@ -10,8 +10,8 @@ or, from Python::
 
 Endpoints: ``GET /health``, ``GET /info``, ``POST /predict``,
 ``POST /predict_batch``, ``POST /predict_set``, ``POST /ood``, and, only when
-updates are allowed, ``POST /examples``, ``POST /forget`` and
-``POST /remove_examples``.
+updates are allowed, ``POST /examples``, ``POST /calibrate``, ``POST /forget``
+and ``POST /remove_examples``.
 
 The classifier takes a lock around every operation, so one process is safe to
 share across requests; scale throughput with several processes (for example
@@ -25,6 +25,8 @@ import argparse
 import asyncio
 import hmac
 import logging
+import math
+import threading
 from typing import Any, Dict, List, Optional
 
 from .classifier import AdaptiveClassifier
@@ -37,7 +39,7 @@ def create_app(
     *,
     allow_updates: bool = False,
     api_key: Optional[str] = None,
-    max_batch: int = 256,
+    max_batch: int = 1000,
     max_text_chars: int = 20_000,
     save_dir: Optional[str] = None,
 ):
@@ -45,12 +47,15 @@ def create_app(
 
     Args:
         classifier: A trained (or loaded) classifier.
-        allow_updates: Enable ``/examples``, ``/forget`` and ``/remove_examples``.
+        allow_updates: Enable ``/examples``, ``/calibrate``, ``/forget`` and
+            ``/remove_examples``.
         api_key: If set, update endpoints require ``Authorization: Bearer <key>``.
             Strongly recommended with ``allow_updates``.
         max_batch: Largest accepted batch (texts per request).
         max_text_chars: Longest accepted text, in characters.
-        save_dir: If set, the classifier is saved there after every update.
+        save_dir: If set, the classifier is saved there after every update. Saves
+            hold every retained example, and the ONNX encoder is exported only
+            the first time (it never changes).
     """
     from .multilabel import MultiLabelAdaptiveClassifier
     if isinstance(classifier, MultiLabelAdaptiveClassifier):
@@ -87,9 +92,18 @@ def create_app(
     class BatchRequest(BaseModel):
         texts: List[str] = Field(min_length=1, max_length=max_batch)
         k: int = Field(default=5, ge=0, le=1000)
+        ood: bool = False
+        ood_threshold: Optional[float] = Field(default=None, gt=0.0)
+
+    class OodResult(BaseModel):
+        ood_score: Optional[float]      # None when the classifier has no classes
+        ood: bool
 
     class BatchResponse(BaseModel):
         predictions: List[List[Prediction]]
+        # Only present when the request asked for "ood": true; index-aligned with predictions.
+        ood: Optional[List[OodResult]] = None
+        ood_threshold: Optional[float] = None
 
     class SetRequest(BaseModel):
         text: str = Field(min_length=1, max_length=max_text_chars)
@@ -102,6 +116,10 @@ def create_app(
     class ExamplesRequest(BaseModel):
         texts: List[str] = Field(min_length=1, max_length=max_batch)
         labels: List[str] = Field(min_length=1, max_length=max_batch)
+
+    class CalibrateRequest(BaseModel):
+        texts: List[str] = Field(min_length=2, max_length=max_batch)
+        labels: List[str] = Field(min_length=2, max_length=max_batch)
 
     class ForgetRequest(BaseModel):
         labels: List[str] = Field(min_length=1, max_length=max_batch)
@@ -130,10 +148,19 @@ def create_app(
                 raise HTTPException(status_code=401, detail="Missing or invalid API key",
                                     headers={"WWW-Authenticate": "Bearer"})
 
+    save_lock = threading.Lock()
+
+    def save():
+        # One save at a time: each file is replaced atomically, but two interleaved saves
+        # could still leave files from different saves side by side.
+        with save_lock:
+            classifier.save(save_dir, all_examples=True)
+
     async def persist():
-        # Saving (with ONNX export) takes seconds; keep it off the event loop.
+        # The first save exports the ONNX encoder (seconds); later ones write only the
+        # learned state. Either way keep it off the event loop.
         if save_dir:
-            await asyncio.to_thread(classifier.save, save_dir)
+            await asyncio.to_thread(save)
 
     def classes():
         # Read under the classifier's lock: an update running in another thread rewrites the label map.
@@ -142,7 +169,18 @@ def create_app(
 
     def snapshot():
         with classifier._lock:
-            return sorted(classifier.label_to_id), classifier.get_memory_stats(), bool(classifier.calibration)
+            config = classifier.config
+            return {
+                "classes": sorted(classifier.label_to_id),
+                "examples_per_class": classifier.get_memory_stats().get("examples_per_class", {}),
+                "calibrated": bool(classifier.calibration),
+                "last_calibrated_at": classifier.last_calibrated_at,
+                "examples_since_calibration": classifier.examples_since_calibration,
+                "max_examples_per_class": config.max_examples_per_class,
+                "retention_recent_fraction": config.retention_recent_fraction,
+                "ood_threshold": config.ood_threshold,
+                "ood_radius_percentile": config.ood_radius_percentile,
+            }
 
     @app.get("/health")
     async def health():
@@ -150,14 +188,13 @@ def create_app(
 
     @app.get("/info")
     async def info():
-        class_names, stats, calibrated = await asyncio.to_thread(snapshot)
+        state = await asyncio.to_thread(snapshot)
         return {
             "version": _version(),
             "model": getattr(classifier, "_model_name", None),
-            "classes": class_names,
-            "examples_per_class": stats.get("examples_per_class", {}),
-            "calibrated": calibrated,
+            **state,
             "updates_allowed": allow_updates,
+            "max_batch": max_batch,
         }
 
     @app.post("/predict", response_model=PredictResponse)
@@ -169,12 +206,22 @@ def create_app(
         abstained = asked_to_abstain and not result and body.k > 0
         return {"predictions": pairs(result), "abstained": abstained}
 
-    @app.post("/predict_batch", response_model=BatchResponse)
+    @app.post("/predict_batch", response_model=BatchResponse, response_model_exclude_unset=True)
     async def predict_batch(body: BatchRequest):
         if any(not t or len(t) > max_text_chars for t in body.texts):
             raise HTTPException(status_code=422, detail=f"Each text must be 1-{max_text_chars} characters")
-        result = await classifier.apredict_batch(body.texts, body.k)
-        return {"predictions": [pairs(r) for r in result]}
+        if not body.ood:
+            result = await classifier.apredict_batch(body.texts, body.k)
+            return {"predictions": [pairs(r) for r in result]}
+        # One encoder pass serves both the predictions and the OOD scores.
+        result, scores = await classifier.apredict_batch_with_ood(body.texts, body.k)
+        limit = classifier.config.ood_threshold if body.ood_threshold is None else body.ood_threshold
+        return {
+            "predictions": [pairs(r) for r in result],
+            "ood": [{"ood_score": None if math.isinf(score) else float(score), "ood": bool(score > limit)}
+                    for score in scores],
+            "ood_threshold": limit,
+        }
 
     @app.post("/predict_set")
     async def predict_set(body: SetRequest):
@@ -195,6 +242,14 @@ def create_app(
         await classifier.aadd_examples(body.texts, body.labels)
         await persist()
         return {"added": len(body.texts), "classes": await asyncio.to_thread(classes)}
+
+    @app.post("/calibrate", dependencies=[Depends(require_updates)])
+    async def calibrate(body: CalibrateRequest):
+        if any(not t or len(t) > max_text_chars for t in body.texts):
+            raise HTTPException(status_code=422, detail=f"Each text must be 1-{max_text_chars} characters")
+        report = await asyncio.to_thread(classifier.calibrate, body.texts, body.labels)
+        await persist()
+        return report
 
     @app.post("/forget", dependencies=[Depends(require_updates)])
     async def forget(body: ForgetRequest):
@@ -225,11 +280,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--allow-updates", action="store_true",
-                        help="Enable /examples, /forget and /remove_examples")
+                        help="Enable /examples, /calibrate, /forget and /remove_examples")
     parser.add_argument("--api-key", default=None,
                         help="Bearer token required for updates (or set ADAPTIVE_CLASSIFIER_API_KEY)")
     parser.add_argument("--save-dir", default=None, help="Save the classifier here after every update")
-    parser.add_argument("--max-batch", type=int, default=256)
+    parser.add_argument("--max-batch", type=int, default=1000,
+                        help="Most texts accepted per request (default 1000)")
+    parser.add_argument("--max-examples-per-class", type=int, default=None,
+                        help="Keep at most this many examples per class (newest plus boundary examples)")
+    parser.add_argument("--retention-recent-fraction", type=float, default=None,
+                        help="Share of --max-examples-per-class kept for the newest examples (default 0.5); "
+                             "the rest keeps the examples closest to another class")
+    parser.add_argument("--ood-radius-percentile", type=float, default=None,
+                        help="Percentile of training distances that defines a class's OOD radius (default 95)")
     parser.add_argument("--no-onnx", action="store_true", help="Use PyTorch even on CPU")
     args = parser.parse_args(argv)
 
@@ -239,7 +302,24 @@ def main(argv: Optional[List[str]] = None) -> None:
     except ImportError as error:          # pragma: no cover
         raise SystemExit('uvicorn is required: pip install "adaptive-classifier[serve]"') from error
 
+    if args.max_batch < 1:
+        parser.error("--max-batch must be at least 1")
+    if args.ood_radius_percentile is not None and not 0 < args.ood_radius_percentile <= 100:
+        parser.error("--ood-radius-percentile must be in (0, 100]")
+    if args.max_examples_per_class is not None and args.max_examples_per_class < 1:
+        parser.error("--max-examples-per-class must be at least 1")
+    if args.retention_recent_fraction is not None and not 0 <= args.retention_recent_fraction <= 1:
+        parser.error("--retention-recent-fraction must be in [0, 1]")
+
     classifier = AdaptiveClassifier.load(args.model, use_onnx=False if args.no_onnx else "auto")
+    if args.ood_radius_percentile is not None:
+        classifier.config.ood_radius_percentile = args.ood_radius_percentile
+    if args.retention_recent_fraction is not None:
+        classifier.config.retention_recent_fraction = args.retention_recent_fraction
+    if args.max_examples_per_class is not None:
+        evicted = classifier.set_max_examples_per_class(args.max_examples_per_class)
+        if evicted:
+            logger.info(f"Evicted {evicted} examples to fit --max-examples-per-class")
     app = create_app(
         classifier,
         allow_updates=args.allow_updates,
