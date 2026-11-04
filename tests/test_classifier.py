@@ -1,3 +1,4 @@
+import gc
 import pytest
 import torch
 import tempfile
@@ -178,25 +179,30 @@ def test_batch_prediction(base_classifier, sample_data):
         assert len(pred) > 0
         assert all(isinstance(p[0], str) and isinstance(p[1], float) for p in pred)
 
-def test_memory_management(base_classifier, sample_data):
+def test_memory_management(sample_data):
     texts, labels = sample_data
-    
+
+    # Build the classifier here rather than via the fixture: pytest keeps fixture
+    # values alive until teardown, so `del` inside the test would free nothing.
+    classifier = AdaptiveClassifier("google-bert/bert-base-uncased")
+
     # Test memory before adding examples
     initial_memory = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
-    
-    base_classifier.add_examples(texts, labels)
-    
+
+    classifier.add_examples(texts, labels)
+
     # Test memory after adding examples
     final_memory = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
-    
+
     # Memory should be managed properly
     if torch.cuda.is_available():
         assert final_memory > initial_memory  # Should use some GPU memory
-        
+
         # Cleanup
-        del base_classifier
+        del classifier
+        gc.collect()
         torch.cuda.empty_cache()
-        
+
         # Memory should be released
         cleanup_memory = torch.cuda.memory_allocated()
         assert cleanup_memory < final_memory

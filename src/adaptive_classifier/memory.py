@@ -69,6 +69,10 @@ class PrototypeMemory:
                 f"does not match memory dimension {self.embedding_dim}"
             )
             
+        # Keep memory on the CPU: FAISS indexes and saved state are CPU-only, and
+        # mixing devices across examples would break torch.stack in prototype updates.
+        example.embedding = example.embedding.detach().cpu()
+
         # Add new example
         self.examples[label].append(example)
         if label in self.prototype_base:

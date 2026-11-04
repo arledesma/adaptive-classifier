@@ -72,13 +72,13 @@ scripts = [
 ]
 
 [tool.uv.sources]
-numpy = { index = "pytorch-cu128" }
-torch = { index = "pytorch-cu128" }
+numpy = { index = "pytorch-cu134" }
+torch = { index = "pytorch-cu134" }
 pyattck = { git = "https://github.com/CAPESandbox/pyattck" }
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl"
+name = "pytorch-cu134"
+url = "https://download.pytorch.org/whl/cu134"
 explicit = true
 
 [project.urls]
@@ -117,7 +117,14 @@ filterwarnings = [
 [dependency-groups]
 dev = [
     "datasets>=3.6.0",
-    "openai>=1.91.0",
-    "sentence-transformers>=4.1.0",
+    "openai>=3.45.0",
+    "sentence-transformers>=5.7.0",
     "textdistance>=4.6.3",
+]
+
+[tool.uv]
+# Fork-only: lock for the Python pinned in .python-version so every package resolves to its newest release.
+environments = [
+    "python_full_version >= '3.13' and sys_platform == 'win32'",
+    "python_full_version >= '3.13' and sys_platform == 'linux'",
 ]
